@@ -1,0 +1,5 @@
+Flask
+gunicorn
+google-auth
+google-api-python-client
+google-cloud-bigquery
