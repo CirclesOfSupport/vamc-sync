@@ -6,8 +6,9 @@ Cloud Run service that syncs VAMC reference data from the VA Zip Codes by Facili
 
 - Reads all root-level Sta# rows (129) from Sheet1 of the VA Zip Codes by Facility sheet
 - Root-level = numeric Sta# only (e.g. `605`, not `605A4`) — covers all 129 parent VA facilities regardless of Type classification
-- Truncates and reloads the `early-alert-responses.RESPONSES.vamc_reference` BQ table nightly
-- Called nightly by Cloud Scheduler; can also be triggered manually for the initial load
+- Compares sheet data against the current state of `early-alert-responses.RESPONSES.vamc_reference` in BigQuery and applies only the delta — inserts for new rows, updates for changed rows, deletes for removed rows
+- If the sheet read fails for any reason, BigQuery is untouched
+- Called nightly by Cloud Scheduler and on-demand after sheet edits
 
 ## BQ table: `vamc_reference`
 
@@ -38,6 +39,11 @@ Cloud Run service that syncs VAMC reference data from the VA Zip Codes by Facili
 
 - `GET /health` — health check
 - `POST /sync` — trigger sync; body: `{"password": "<SYNC_PASSWORD>"}`
+
+Response:
+```json
+{"status": "success", "inserted": 0, "updated": 2, "deleted": 0}
+```
 
 ## Deployment
 
