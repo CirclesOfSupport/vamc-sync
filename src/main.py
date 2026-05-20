@@ -38,6 +38,9 @@ COLUMN_MAP = [
     ("Display Name",            "display_name"),
 ]
 
+# Fields that constitute a change — sta_num is the key, everything else is compared
+COMPARE_FIELDS = ["main_vamc", "state", "zip_start", "common_name", "short_code", "city", "display_name"]
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 
@@ -73,12 +76,12 @@ def get_bq_client():
 # Sheet reading
 # ---------------------------------------------------------------------------
 
-def read_vamc_rows():
+def read_sheet_rows():
     """
     Read all root-level Sta# rows from Sheet1.
-    Root-level = numeric Sta# only (no alpha suffix).
-    This gives 129 rows covering all parent VA facilities regardless of Type.
-    Returns list of dicts with BQ field names as keys.
+    Root-level = numeric Sta# only (e.g. '605', not '605A4').
+    Covers all 129 parent VA facilities regardless of Type classification.
+    Returns dict keyed by sta_num.
     """
     service = get_sheets_client()
     spreadsheet = service.spreadsheets().values().get(
@@ -93,13 +96,11 @@ def read_vamc_rows():
 
     headers = [h.strip() for h in all_rows[0]]
 
-    # Locate Sta# column index
     try:
         sta_idx = headers.index("Sta#")
     except ValueError:
         raise ValueError(f"Column 'Sta#' not found in sheet headers: {headers}")
 
-    # Locate all mapped column indices
     col_indices = {}
     for sheet_col, bq_field in COLUMN_MAP:
         try:
@@ -107,34 +108,48 @@ def read_vamc_rows():
         except ValueError:
             raise ValueError(f"Column '{sheet_col}' not found in sheet headers: {headers}")
 
-    vamc_rows = []
+    rows = {}
     for row in all_rows[1:]:
         sta = row[sta_idx].strip() if sta_idx < len(row) else ""
         if not sta or not is_root_sta(sta):
             continue
-
         record = {}
         for bq_field, idx in col_indices.items():
             record[bq_field] = row[idx].strip() if idx < len(row) else ""
+        rows[sta] = record
 
-        vamc_rows.append(record)
-
-    logger.info(f"Read {len(vamc_rows)} root-level VA facility rows from sheet")
-    return vamc_rows
+    logger.info(f"Read {len(rows)} root-level rows from sheet")
+    return rows
 
 
 # ---------------------------------------------------------------------------
-# BQ sync
+# BQ helpers
 # ---------------------------------------------------------------------------
 
-def sync_to_bq(rows):
+def get_bq_rows(client):
     """
-    Replace vamc_reference table contents with the provided rows.
-    Uses TRUNCATE + INSERT pattern for simplicity given the small table size (129 rows).
+    Read current vamc_reference contents from BQ.
+    Returns dict keyed by sta_num.
     """
-    client = get_bq_client()
+    table_ref = f"`{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`"
+    query = f"SELECT * FROM {table_ref}"
+    try:
+        result = client.query(query).result()
+        rows = {}
+        for row in result:
+            d = dict(row)
+            rows[d["sta_num"]] = d
+        logger.info(f"Read {len(rows)} rows from BQ")
+        return rows
+    except Exception:
+        # Table may not exist yet on first run
+        logger.info("BQ table not found or empty — treating as empty")
+        return {}
+
+
+def ensure_table(client):
+    """Create vamc_reference table if it doesn't exist."""
     table_ref = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
-
     schema = [
         bigquery.SchemaField("sta_num",      "STRING"),
         bigquery.SchemaField("main_vamc",    "STRING"),
@@ -145,21 +160,76 @@ def sync_to_bq(rows):
         bigquery.SchemaField("city",         "STRING"),
         bigquery.SchemaField("display_name", "STRING"),
     ]
-
     table = bigquery.Table(table_ref, schema=schema)
     client.create_table(table, exists_ok=True)
 
-    # Truncate existing rows
-    client.query(f"TRUNCATE TABLE `{table_ref}`").result()
-    logger.info(f"Truncated {table_ref}")
 
-    # Insert new rows
-    errors = client.insert_rows_json(table_ref, rows)
-    if errors:
-        raise RuntimeError(f"BQ insert errors: {errors}")
+# ---------------------------------------------------------------------------
+# Sync logic
+# ---------------------------------------------------------------------------
 
-    logger.info(f"Inserted {len(rows)} rows into {table_ref}")
-    return len(rows)
+def compute_delta(sheet_rows, bq_rows):
+    """
+    Compare sheet rows against BQ rows and return inserts, updates, deletes.
+    """
+    to_insert = []
+    to_update = []
+    to_delete = []
+
+    for sta, sheet_row in sheet_rows.items():
+        if sta not in bq_rows:
+            to_insert.append(sheet_row)
+        else:
+            bq_row = bq_rows[sta]
+            changed = any(
+                sheet_row.get(f, "") != str(bq_row.get(f, "") or "")
+                for f in COMPARE_FIELDS
+            )
+            if changed:
+                to_update.append(sheet_row)
+
+    for sta in bq_rows:
+        if sta not in sheet_rows:
+            to_delete.append(sta)
+
+    return to_insert, to_update, to_delete
+
+
+def apply_delta(client, to_insert, to_update, to_delete):
+    """Apply inserts, updates, and deletes to vamc_reference."""
+    table_ref = f"`{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`"
+    full_ref = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+
+    if to_insert:
+        errors = client.insert_rows_json(full_ref, to_insert)
+        if errors:
+            raise RuntimeError(f"BQ insert errors: {errors}")
+        logger.info(f"Inserted {len(to_insert)} rows")
+
+    for row in to_update:
+        sta = row["sta_num"]
+        set_clauses = ", ".join(
+            f"{f} = @{f}" for f in COMPARE_FIELDS
+        )
+        params = [
+            bigquery.ScalarQueryParameter(f, "STRING", row.get(f, ""))
+            for f in COMPARE_FIELDS
+        ]
+        params.append(bigquery.ScalarQueryParameter("sta_num", "STRING", sta))
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        client.query(
+            f"UPDATE {table_ref} SET {set_clauses} WHERE sta_num = @sta_num",
+            job_config=job_config
+        ).result()
+    if to_update:
+        logger.info(f"Updated {len(to_update)} rows")
+
+    if to_delete:
+        sta_list = ", ".join(f"'{s}'" for s in to_delete)
+        client.query(
+            f"DELETE FROM {table_ref} WHERE sta_num IN ({sta_list})"
+        ).result()
+        logger.info(f"Deleted {len(to_delete)} rows")
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +244,13 @@ def health():
 @app.route("/sync", methods=["POST"])
 def sync():
     """
-    Trigger a sync from Google Sheet to BigQuery.
+    Sync VA facility reference data from Google Sheet to BigQuery.
 
-    Called by Cloud Scheduler nightly, or manually for the initial load.
+    Compares sheet against current BQ state and applies only the delta —
+    inserts for new rows, updates for changed rows, deletes for removed rows.
+    If the sheet read fails, BQ is untouched.
+
+    Called nightly by Cloud Scheduler or on-demand after sheet edits.
 
     Request body (JSON):
     {
@@ -186,7 +260,9 @@ def sync():
     Response:
     {
         "status": "success",
-        "rows_synced": 129
+        "inserted": 0,
+        "updated": 2,
+        "deleted": 0
     }
     """
     body = request.get_json(force=True, silent=True) or {}
@@ -195,9 +271,27 @@ def sync():
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
     try:
-        rows = read_vamc_rows()
-        count = sync_to_bq(rows)
-        return jsonify({"status": "success", "rows_synced": count}), 200
+        # Read sheet first — if this fails, BQ is never touched
+        sheet_rows = read_sheet_rows()
+
+        client = get_bq_client()
+        ensure_table(client)
+        bq_rows = get_bq_rows(client)
+
+        to_insert, to_update, to_delete = compute_delta(sheet_rows, bq_rows)
+
+        if not to_insert and not to_update and not to_delete:
+            logger.info("No changes detected")
+            return jsonify({"status": "success", "inserted": 0, "updated": 0, "deleted": 0}), 200
+
+        apply_delta(client, to_insert, to_update, to_delete)
+
+        return jsonify({
+            "status": "success",
+            "inserted": len(to_insert),
+            "updated": len(to_update),
+            "deleted": len(to_delete),
+        }), 200
 
     except ValueError as e:
         logger.exception("Data error during sync")
