@@ -308,3 +308,37 @@ def sync():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+
+@app.route("/debug", methods=["POST"])
+def debug():
+    """Debug endpoint to isolate auth issues."""
+    body = request.get_json(force=True, silent=True) or {}
+    if SYNC_PASSWORD and body.get("password") != SYNC_PASSWORD:
+        return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+    results = {}
+
+    # Test 1: Sheets auth
+    try:
+        service = get_sheets_client()
+        results["sheets_auth"] = "ok"
+    except Exception as e:
+        results["sheets_auth"] = str(e)
+
+    # Test 2: BQ auth
+    try:
+        client = get_bq_client()
+        results["bq_auth"] = "ok"
+    except Exception as e:
+        results["bq_auth"] = str(e)
+
+    # Test 3: BQ query
+    try:
+        client = get_bq_client()
+        list(client.query("SELECT 1").result())
+        results["bq_query"] = "ok"
+    except Exception as e:
+        results["bq_query"] = str(e)
+
+    return jsonify(results), 200
