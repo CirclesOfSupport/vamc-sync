@@ -41,10 +41,7 @@ COLUMN_MAP = [
 # Fields that constitute a change — sta_num is the key, everything else is compared
 COMPARE_FIELDS = ["main_vamc", "state", "zip_start", "common_name", "short_code", "city", "display_name"]
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/bigquery",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 
 def is_root_sta(sta):
@@ -56,8 +53,8 @@ def is_root_sta(sta):
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-def get_credentials():
-    """Get refreshed OAuth credentials covering both Sheets and BigQuery scopes."""
+def get_sheets_client():
+    """Build Sheets API client using OAuth refresh token."""
     creds = Credentials(
         token=None,
         refresh_token=os.environ.get("OAUTH_REFRESH_TOKEN"),
@@ -67,17 +64,12 @@ def get_credentials():
         scopes=SCOPES,
     )
     creds.refresh(Request())
-    return creds
-
-
-def get_sheets_client():
-    """Build Sheets API client using OAuth credentials."""
-    return build("sheets", "v4", credentials=get_credentials())
+    return build("sheets", "v4", credentials=creds)
 
 
 def get_bq_client():
-    """Build BigQuery client using same OAuth credentials as Sheets."""
-    return bigquery.Client(project=BQ_PROJECT, credentials=get_credentials())
+    """Build BigQuery client using ambient service account credentials (ADC)."""
+    return bigquery.Client(project=BQ_PROJECT)
 
 
 # ---------------------------------------------------------------------------
