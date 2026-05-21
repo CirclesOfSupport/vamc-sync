@@ -41,7 +41,7 @@ COLUMN_MAP = [
 # Fields that constitute a change — sta_num is the key, everything else is compared
 COMPARE_FIELDS = ["main_vamc", "state", "zip_start", "common_name", "short_code", "city", "display_name"]
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def is_root_sta(sta):
