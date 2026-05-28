@@ -43,6 +43,20 @@ COMPARE_FIELDS = ["main_vamc", "state", "zip_start", "common_name", "short_code"
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# ---------------------------------------------------------------------------
+# Join mode: controls how vamc_display_name is populated on users/response_data
+#
+# "name_string" (current): vamc_presumed contains mixed-case name strings.
+#     JOIN condition: UPPER(vamc_presumed) = vamc_reference.main_vamc
+#
+# "sta_num" (after full Sta# backfill): vamc_presumed contains Sta# values.
+#     JOIN condition: vamc_presumed = vamc_reference.sta_num
+#
+# Switch this env var to "sta_num" after the full BQ vamc_presumed backfill
+# completes. No code change required.
+# ---------------------------------------------------------------------------
+JOIN_MODE = os.environ.get("VAMC_JOIN_MODE", "name_string")
+
 
 def is_root_sta(sta):
     """Root-level Sta# is numeric only — no alpha suffix (e.g. '605', not '605A4')."""
@@ -142,7 +156,6 @@ def get_bq_rows(client):
         logger.info(f"Read {len(rows)} rows from BQ")
         return rows
     except Exception:
-        # Table may not exist yet on first run
         logger.info("BQ table not found or empty — treating as empty")
         return {}
 
@@ -233,6 +246,58 @@ def apply_delta(client, to_insert, to_update, to_delete):
 
 
 # ---------------------------------------------------------------------------
+# Display name population
+# ---------------------------------------------------------------------------
+
+def populate_display_names(client):
+    """
+    Populate vamc_display_name on users and response_data for any rows
+    that have vamc_presumed set but vamc_display_name not yet populated.
+
+    JOIN mode is controlled by VAMC_JOIN_MODE env var:
+      "name_string" (default): JOIN on UPPER(vamc_presumed) = vamc_reference.main_vamc
+      "sta_num": JOIN on vamc_presumed = vamc_reference.sta_num
+
+    Only touches rows where vamc_display_name IS NULL — safe to run repeatedly.
+    """
+    ref = f"`{BQ_PROJECT}.{BQ_DATASET}.vamc_reference`"
+
+    if JOIN_MODE == "sta_num":
+        join_condition = "t.vamc_presumed = r.sta_num"
+        logger.info("populate_display_names: using sta_num join mode")
+    else:
+        join_condition = "UPPER(t.vamc_presumed) = r.main_vamc"
+        logger.info("populate_display_names: using name_string join mode")
+
+    results = {}
+
+    for target_table in ["users", "response_data"]:
+        tbl = f"`{BQ_PROJECT}.{BQ_DATASET}.{target_table}`"
+        query = f"""
+            UPDATE {tbl} t
+            SET t.vamc_display_name = r.display_name
+            FROM {ref} r
+            WHERE {join_condition}
+              AND t.vamc_presumed IS NOT NULL
+              AND t.vamc_presumed != ''
+              AND (t.vamc_display_name IS NULL OR t.vamc_display_name = '')
+        """
+        try:
+            job = client.query(query)
+            job.result()
+            rows_affected = job.num_dml_affected_rows or 0
+            logger.info(f"populate_display_names: {target_table} — {rows_affected} rows updated")
+            results[target_table] = rows_affected
+        except Exception as e:
+            # Concurrent write conflict on response_data is expected during high traffic.
+            # Log and continue — next scheduled run will catch remaining rows.
+            logger.warning(f"populate_display_names: {target_table} failed — {e}")
+            results[target_table] = f"error: {str(e)}"
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -244,11 +309,19 @@ def health():
 @app.route("/sync", methods=["POST"])
 def sync():
     """
-    Sync VA facility reference data from Google Sheet to BigQuery.
+    Sync VA facility reference data from Google Sheet to BigQuery,
+    then populate vamc_display_name on users and response_data.
 
-    Compares sheet against current BQ state and applies only the delta —
-    inserts for new rows, updates for changed rows, deletes for removed rows.
-    If the sheet read fails, BQ is untouched.
+    Phase 1: Compare sheet against vamc_reference and apply delta
+             (inserts/updates/deletes). If sheet read fails, vamc_reference
+             is untouched but Phase 2 still runs.
+
+    Phase 2: UPDATE vamc_display_name on users and response_data for any
+             rows with vamc_presumed set but vamc_display_name not yet
+             populated. Runs regardless of Phase 1 outcome — the two phases
+             are independent. JOIN mode controlled by VAMC_JOIN_MODE env var.
+             Concurrent write conflicts on response_data are logged and
+             tolerated — next run will catch remaining rows.
 
     Called nightly by Cloud Scheduler or on-demand after sheet edits.
 
@@ -262,7 +335,11 @@ def sync():
         "status": "success",
         "inserted": 0,
         "updated": 2,
-        "deleted": 0
+        "deleted": 0,
+        "display_names": {
+            "users": 142,
+            "response_data": 1834
+        }
     }
     """
     body = request.get_json(force=True, silent=True) or {}
@@ -270,35 +347,51 @@ def sync():
     if SYNC_PASSWORD and body.get("password") != SYNC_PASSWORD:
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
 
-    try:
-        # Read sheet first — if this fails, BQ is never touched
-        sheet_rows = read_sheet_rows()
+    client = get_bq_client()
+    phase1_result = {}
+    phase1_error = None
 
-        client = get_bq_client()
+    # Phase 1: Sheet → vamc_reference sync
+    # Runs independently of Phase 2. If sheet read fails, vamc_reference is
+    # untouched but Phase 2 still runs against the existing reference data.
+    try:
+        sheet_rows = read_sheet_rows()
         ensure_table(client)
         bq_rows = get_bq_rows(client)
-
         to_insert, to_update, to_delete = compute_delta(sheet_rows, bq_rows)
 
-        if not to_insert and not to_update and not to_delete:
-            logger.info("No changes detected")
-            return jsonify({"status": "success", "inserted": 0, "updated": 0, "deleted": 0}), 200
+        if to_insert or to_update or to_delete:
+            apply_delta(client, to_insert, to_update, to_delete)
+        else:
+            logger.info("Phase 1: No vamc_reference changes detected")
 
-        apply_delta(client, to_insert, to_update, to_delete)
-
-        return jsonify({
-            "status": "success",
+        phase1_result = {
             "inserted": len(to_insert),
             "updated": len(to_update),
             "deleted": len(to_delete),
-        }), 200
-
-    except ValueError as e:
-        logger.exception("Data error during sync")
-        return jsonify({"status": "error", "message": str(e)}), 400
+        }
     except Exception as e:
-        logger.exception("Unexpected error during sync")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.exception("Phase 1 (sheet sync) failed — proceeding to Phase 2")
+        phase1_error = str(e)
+        phase1_result = {"inserted": 0, "updated": 0, "deleted": 0}
+
+    # Phase 2: Populate vamc_display_name on users and response_data
+    # Runs regardless of Phase 1 outcome. Reads from vamc_reference as-is.
+    try:
+        display_name_results = populate_display_names(client)
+    except Exception as e:
+        logger.exception("Phase 2 (display name population) failed")
+        display_name_results = {"error": str(e)}
+
+    response = {
+        "status": "success" if not phase1_error else "partial",
+        **phase1_result,
+        "display_names": display_name_results,
+    }
+    if phase1_error:
+        response["phase1_error"] = phase1_error
+
+    return jsonify(response), 200
 
 
 # ---------------------------------------------------------------------------
