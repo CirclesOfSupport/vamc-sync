@@ -252,13 +252,17 @@ def apply_delta(client, to_insert, to_update, to_delete):
 def populate_display_names(client):
     """
     Populate vamc_display_name on users and response_data for any rows
-    that have vamc_presumed set but vamc_display_name not yet populated.
+    where the stored vamc_display_name is missing OR doesn't match the
+    current vamc_reference.display_name for the joined Sta#.
 
     JOIN mode is controlled by VAMC_JOIN_MODE env var:
       "name_string" (default): JOIN on UPPER(vamc_presumed) = vamc_reference.main_vamc
       "sta_num": JOIN on vamc_presumed = vamc_reference.sta_num
 
-    Only touches rows where vamc_display_name IS NULL — safe to run repeatedly.
+    Touches rows where vamc_display_name IS NULL, is empty, or is stale
+    (differs from the joined r.display_name). Safe to run repeatedly —
+    once a row's display_name matches the reference, it stops matching
+    the WHERE clause.
     """
     ref = f"`{BQ_PROJECT}.{BQ_DATASET}.vamc_reference`"
 
@@ -290,7 +294,11 @@ def populate_display_names(client):
             WHERE {join_condition}
               AND t.vamc_presumed IS NOT NULL
               AND t.vamc_presumed != ''
-              AND (t.vamc_display_name IS NULL OR t.vamc_display_name = '')
+              AND (
+                t.vamc_display_name IS NULL
+                OR t.vamc_display_name = ''
+                OR t.vamc_display_name != r.display_name
+              )
               {date_filter}
         """
         try:
