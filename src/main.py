@@ -273,6 +273,16 @@ def populate_display_names(client):
 
     for target_table in ["users", "response_data"]:
         tbl = f"`{BQ_PROJECT}.{BQ_DATASET}.{target_table}`"
+
+        # For response_data, restrict to rows before today to avoid concurrent
+        # write conflicts from whatever processes are actively writing to the
+        # table. Today's rows are picked up on the next nightly run.
+        date_filter = (
+            "AND t.checkinDateTime < DATETIME(CURRENT_DATE())"
+            if target_table == "response_data"
+            else ""
+        )
+
         query = f"""
             UPDATE {tbl} t
             SET t.vamc_display_name = r.display_name
@@ -281,6 +291,7 @@ def populate_display_names(client):
               AND t.vamc_presumed IS NOT NULL
               AND t.vamc_presumed != ''
               AND (t.vamc_display_name IS NULL OR t.vamc_display_name = '')
+              {date_filter}
         """
         try:
             job = client.query(query)
