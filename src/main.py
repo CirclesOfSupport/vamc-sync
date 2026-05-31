@@ -281,8 +281,11 @@ def populate_display_names(client):
         # For response_data, restrict to rows before today to avoid concurrent
         # write conflicts from whatever processes are actively writing to the
         # table. Today's rows are picked up on the next nightly run.
+        # NULL checkinDateTime rows are included explicitly — they are not
+        # actively written to and would otherwise never be caught by the
+        # prior-day boundary.
         date_filter = (
-            "AND t.checkinDateTime < DATETIME(CURRENT_DATE())"
+            "AND (t.checkinDateTime < DATETIME(CURRENT_DATE()) OR t.checkinDateTime IS NULL)"
             if target_table == "response_data"
             else ""
         )
